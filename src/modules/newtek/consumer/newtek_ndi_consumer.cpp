@@ -260,23 +260,12 @@ struct newtek_ndi_consumer : public core::frame_consumer
                     graph_->set_value("ndi-tick", ndi_timer_.elapsed() * format_desc_.fps * 0.5);
                     ndi_timer_.restart();
                     frame_timer_.restart();
-                    auto audio_data             = frame.audio_data();
-                    int  audio_data_size        = static_cast<int>(audio_data.size());
-                    ndi_audio_frame_.no_samples = audio_data_size / format_desc_.audio_channels;
-                    ndi_audio_frame_.p_data     = const_cast<int*>(audio_data.data());
-                    ndi_lib_->util_send_send_audio_interleaved_32s(*ndi_send_instance_, &ndi_audio_frame_);
-                    if (format_desc_.field_count == 2 && allow_fields_) {
-                        ndi_video_frame_.frame_format_type =
-                            (frame_no_ % 2 ? NDIlib_frame_format_type_field_1 : NDIlib_frame_format_type_field_0);
-                        for (auto y = 0; y < ndi_video_frame_.yres; ++y) {
-                            std::memcpy(reinterpret_cast<char*>(ndi_video_frame_.p_data) + y * format_desc_.width * 4,
-                                        frame.image_data(0).data() + (y * 2 + frame_no_ % 2) * format_desc_.width * 4,
-                                        format_desc_.width * 4);
-                        }
-                    } else {
-                        ndi_video_frame_.p_data = const_cast<uint8_t*>(frame.image_data(0).begin());
+                    // The SDK compresses every frame on the CPU even with no receiver connected. The
+                    // sender stays advertised, and the next tick after a receiver connects sends again.
+                    if (ndi_lib_->send_get_no_connections(*ndi_send_instance_, 0) > 0) {
+                        send_audio(frame);
+                        send_video(frame);
                     }
-                    ndi_lib_->send_send_video_v2(*ndi_send_instance_, &ndi_video_frame_);
                     frame_no_++;
                     graph_->set_value("frame-time", frame_timer_.elapsed() * format_desc_.fps * 0.5);
                     std::this_thread::sleep_until(time_point);
@@ -286,6 +275,31 @@ struct newtek_ndi_consumer : public core::frame_consumer
                 // NOTHING
             }
         });
+    }
+
+    void send_audio(const core::const_frame& frame)
+    {
+        auto audio_data             = frame.audio_data();
+        int  audio_data_size        = static_cast<int>(audio_data.size());
+        ndi_audio_frame_.no_samples = audio_data_size / format_desc_.audio_channels;
+        ndi_audio_frame_.p_data     = const_cast<int*>(audio_data.data());
+        ndi_lib_->util_send_send_audio_interleaved_32s(*ndi_send_instance_, &ndi_audio_frame_);
+    }
+
+    void send_video(const core::const_frame& frame)
+    {
+        if (format_desc_.field_count == 2 && allow_fields_) {
+            ndi_video_frame_.frame_format_type =
+                (frame_no_ % 2 ? NDIlib_frame_format_type_field_1 : NDIlib_frame_format_type_field_0);
+            for (auto y = 0; y < ndi_video_frame_.yres; ++y) {
+                std::memcpy(reinterpret_cast<char*>(ndi_video_frame_.p_data) + y * format_desc_.width * 4,
+                            frame.image_data(0).data() + (y * 2 + frame_no_ % 2) * format_desc_.width * 4,
+                            format_desc_.width * 4);
+            }
+        } else {
+            ndi_video_frame_.p_data = const_cast<uint8_t*>(frame.image_data(0).begin());
+        }
+        ndi_lib_->send_send_video_v2(*ndi_send_instance_, &ndi_video_frame_);
     }
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
