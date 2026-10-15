@@ -31,6 +31,18 @@ set(SOURCES
 		StdAfx.h
 )
 
+# SpeedHQ on CUDA. The kernels are prebuilt into shq/shq_kernels_fatbin.h (shq/build_kernels.sh)
+# and libcuda.so.1 is loaded at run time, so the build needs no CUDA toolkit.
+if (NOT MSVC)
+	list(APPEND SOURCES
+		shq/shq_cuda.cpp
+		shq/shq_cuda.h
+		shq/shq_format.h
+		shq/shq_kernels_fatbin.h
+		shq/shq_rate.h
+	)
+endif()
+
 casparcg_add_module_project(newtek
 	SOURCES ${SOURCES}
 	INIT_FUNCTION "newtek::init"
@@ -46,6 +58,11 @@ source_group(sources\\consumer consumer/*)
 source_group(sources\\producer producer/*)
 source_group(sources\\interop interop/*)
 source_group(sources\\util util/*)
+source_group(sources\\shq shq/*)
 source_group(sources ./*)
 
 target_link_libraries(newtek PRIVATE ffmpeg)
+
+if (NOT MSVC)
+	target_link_libraries(newtek PRIVATE ${CMAKE_DL_LIBS})
+endif()
