@@ -58,6 +58,7 @@ extern "C" {
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
+#include <libavutil/buffer.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
@@ -68,9 +69,15 @@ extern "C" {
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
 
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
+
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 namespace caspar { namespace ffmpeg {
 
@@ -78,6 +85,128 @@ namespace caspar { namespace ffmpeg {
 // TODO multiple output files
 // TODO run video filter, video encoder, audio filter, audio encoder in separate threads.
 // TODO realtime with smaller buffer?
+
+struct queued_frame
+{
+    core::const_frame frame;
+    std::int64_t      video_pts = 0;
+    std::int64_t      audio_pts = 0;
+    core::video_field field     = core::video_field::progressive;
+};
+
+// Page-locked copies of the frames that are encoded. cuMemcpy2DAsync DMAs from this memory;
+// the same call on a pageable AVFrame copies the frame on the CPU first.
+#ifndef _WIN32
+struct cuda_host
+{
+    void* lib = nullptr;
+    void* ctx = nullptr;
+    int (*init)(unsigned)           = nullptr;
+    int (*device_get)(int*, int)    = nullptr;
+    int (*ctx_create)(void**, unsigned, int) = nullptr;
+    int (*ctx_destroy)(void*)       = nullptr;
+    int (*ctx_pop)(void**)          = nullptr;
+    int (*ctx_set)(void*)           = nullptr;
+    int (*host_alloc)(void**, size_t, unsigned) = nullptr;
+    int (*host_free)(void*)         = nullptr;
+    std::vector<void*>              blocks;
+
+    cuda_host() = default;
+    cuda_host(const cuda_host&) = delete;
+    cuda_host& operator=(const cuda_host&) = delete;
+    cuda_host(cuda_host&&) = delete;
+    cuda_host& operator=(cuda_host&&) = delete;
+
+    ~cuda_host()
+    {
+        if (ctx && ctx_set)
+            ctx_set(ctx);
+        for (auto* block : blocks) {
+            if (host_free && block)
+                host_free(block);
+        }
+        blocks.clear();
+        if (ctx && ctx_destroy)
+            ctx_destroy(ctx);
+        if (lib)
+            dlclose(lib);
+    }
+
+    template <typename T>
+    T symbol(const char* name, const char* fallback = nullptr) const
+    {
+        auto* found = dlsym(lib, name);
+        if (!found && fallback)
+            found = dlsym(lib, fallback);
+        return reinterpret_cast<T>(found);
+    }
+
+    bool prepare(int width, int height, AVRational sar, std::vector<std::shared_ptr<AVFrame>>& pool)
+    {
+        lib = dlopen("libcuda.so.1", RTLD_LAZY);
+        if (!lib)
+            return false;
+        init       = symbol<decltype(init)>("cuInit");
+        device_get = symbol<decltype(device_get)>("cuDeviceGet");
+        ctx_create = symbol<decltype(ctx_create)>("cuCtxCreate_v2", "cuCtxCreate");
+        ctx_destroy = symbol<decltype(ctx_destroy)>("cuCtxDestroy_v2", "cuCtxDestroy");
+        ctx_pop    = symbol<decltype(ctx_pop)>("cuCtxPopCurrent_v2", "cuCtxPopCurrent");
+        ctx_set    = symbol<decltype(ctx_set)>("cuCtxSetCurrent");
+        host_alloc = symbol<decltype(host_alloc)>("cuMemHostAlloc");
+        host_free  = symbol<decltype(host_free)>("cuMemFreeHost");
+        if (!init || !device_get || !ctx_create || !ctx_destroy || !ctx_pop || !ctx_set || !host_alloc || !host_free)
+            return false;
+        if (init(0) != 0)
+            return false;
+        int device = 0;
+        if (device_get(&device, 0) != 0)
+            return false;
+        if (ctx_create(&ctx, 0, device) != 0)
+            return false;
+
+        auto ok = true;
+        for (int n = 0; n < 3; ++n) {
+            auto frame = make_frame(width, height, sar);
+            if (!frame)
+                ok = false;
+            else
+                pool.push_back(std::move(frame));
+        }
+        void* popped = nullptr;
+        ctx_pop(&popped);
+        return ok && pool.size() == 3;
+    }
+
+    std::shared_ptr<AVFrame> make_frame(int width, int height, AVRational sar)
+    {
+        const auto bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+        void*      host  = nullptr;
+        // CU_MEMHOSTALLOC_PORTABLE: every CUDA context, including the encoder's, can DMA this.
+        if (host_alloc(&host, bytes, 0x01) != 0 || !host)
+            return nullptr;
+        blocks.push_back(host);
+        auto* buf = av_buffer_create(static_cast<uint8_t*>(host),
+                                     bytes,
+                                     [](void*, uint8_t*) {},
+                                     nullptr,
+                                     0);
+        if (!buf) {
+            blocks.pop_back();
+            host_free(host);
+            return nullptr;
+        }
+        auto frame                   = alloc_frame();
+        frame->format                = AV_PIX_FMT_BGR0;
+        frame->width                 = width;
+        frame->height                = height;
+        frame->sample_aspect_ratio   = sar;
+        frame->data[0]               = buf->data;
+        frame->linesize[0]           = width * 4;
+        frame->buf[0]                = buf;
+        return frame;
+    }
+};
+#endif
 
 struct Stream
 {
@@ -87,6 +216,15 @@ struct Stream
 
     std::shared_ptr<AVCodecContext> enc = nullptr;
     AVStream*                       st  = nullptr;
+
+    bool upload_ = false;
+#ifndef _WIN32
+    std::unique_ptr<cuda_host>            cuda_;
+    std::vector<std::shared_ptr<AVFrame>> pinned_;
+    AVRational                            sar_{1, 1};
+    int                                   upload_width_  = 0;
+    int                                   upload_height_ = 0;
+#endif
 
     Stream(AVFormatContext*                    oc,
            std::string                         suffix,
@@ -172,7 +310,28 @@ struct Stream
                 const auto sar = boost::rational<int>(format_desc.square_width, format_desc.square_height) /
                                  boost::rational<int>(format_desc.width, format_desc.height);
 
-                const auto pix_fmt = (depth == common::bit_depth::bit8) ? AV_PIX_FMT_BGRA : AV_PIX_FMT_BGRA64LE;
+                auto pix_fmt = (depth == common::bit_depth::bit8) ? AV_PIX_FMT_BGRA : AV_PIX_FMT_BGRA64LE;
+#ifndef _WIN32
+                // BGRA and bgr0 are the same bytes. hwupload_cuda accepts bgr0, and a pinned bgr0 frame
+                // is DMA'd instead of converted by the format filter.
+                if (depth == common::bit_depth::bit8 && filter_spec.find("hwupload_cuda") != std::string::npos) {
+                    cuda_ = std::make_unique<cuda_host>();
+                    AVRational ratio{sar.numerator(), sar.denominator()};
+                    if (cuda_->prepare(format_desc.width, format_desc.height, ratio, pinned_)) {
+                        upload_        = true;
+                        sar_           = ratio;
+                        upload_width_  = format_desc.width;
+                        upload_height_ = format_desc.height;
+                        pix_fmt        = AV_PIX_FMT_BGR0;
+                        CASPAR_LOG(info) << L"ffmpeg consumer: pinned CUDA upload " << format_desc.width << L"x"
+                                         << format_desc.height;
+                    } else {
+                        pinned_.clear();
+                        cuda_.reset();
+                        CASPAR_LOG(warning) << L"ffmpeg consumer: pinned CUDA upload unavailable";
+                    }
+                }
+#endif
 
                 auto args = (boost::format("video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:sar=%d/%d:frame_rate=%d/%d") %
                              format_desc.width % format_desc.height % pix_fmt % format_desc.duration %
@@ -310,6 +469,13 @@ struct Stream
             enc->sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(sink);
             enc->time_base           = st->time_base;
             enc->pix_fmt             = static_cast<AVPixelFormat>(av_buffersink_get_format(sink));
+            // buffersink returns the graph's own reference. The codec frees hw_frames_ctx, so it needs a ref of its own.
+            if (auto* hw_frames = av_buffersink_get_hw_frames_ctx(sink)) {
+                enc->hw_frames_ctx = av_buffer_ref(hw_frames);
+                if (!enc->hw_frames_ctx) {
+                    FF_RET(AVERROR(ENOMEM), "av_buffer_ref");
+                }
+            }
         } else if (codec->type == AVMEDIA_TYPE_AUDIO) {
             st->time_base = {1, av_buffersink_get_sample_rate(sink)};
 
@@ -345,19 +511,60 @@ struct Stream
         }
     }
 
-    void send(std::tuple<core::const_frame, std::int64_t, std::int64_t>& data,
-              const core::video_format_desc&                             format_desc,
-              std::function<void(std::shared_ptr<AVPacket>)>             cb)
+    ~Stream()
+    {
+        graph.reset();
+#ifndef _WIN32
+        pinned_.clear();
+#endif
+    }
+
+#ifndef _WIN32
+    std::shared_ptr<AVFrame> acquire_pinned(const core::const_frame& src, std::int64_t pts)
+    {
+        const auto bytes = static_cast<size_t>(upload_width_) * static_cast<size_t>(upload_height_) * 4;
+        if (src.pixel_format_desc().planes.empty() || src.image_data(0).size() < bytes)
+            return nullptr;
+        for (auto& candidate : pinned_) {
+            if (candidate && candidate->buf[0] && av_buffer_get_ref_count(candidate->buf[0]) == 1) {
+                candidate->data[0] = candidate->buf[0]->data;
+                std::memcpy(candidate->data[0], src.image_data(0).data(), bytes);
+                candidate->pts = pts;
+                return candidate;
+            }
+        }
+        CASPAR_LOG(warning) << L"ffmpeg consumer: pinned frame still in use";
+        return nullptr;
+    }
+#endif
+
+    void send(queued_frame&                                  data,
+              const core::video_format_desc&                 format_desc,
+              std::function<void(std::shared_ptr<AVPacket>)> cb)
     {
         std::shared_ptr<AVFrame>  frame;
         std::shared_ptr<AVPacket> pkt;
 
-        const auto [in_frame, video_pts, audio_pts] = data;
+        const auto& in_frame  = data.frame;
+        const auto  video_pts = data.video_pts;
+        const auto  audio_pts = data.audio_pts;
 
         if (in_frame) {
             if (enc->codec_type == AVMEDIA_TYPE_VIDEO) {
-                frame      = make_av_video_frame(in_frame, format_desc);
-                frame->pts = video_pts;
+#ifndef _WIN32
+                // The second interlaced field is a full frame that fps= would discard after the copy.
+                if (upload_ && data.field == core::video_field::b && format_desc.field_count == 2)
+                    return;
+                if (upload_) {
+                    frame = acquire_pinned(in_frame, video_pts);
+                    if (!frame)
+                        return;
+                } else
+#endif
+                {
+                    frame      = make_av_video_frame(in_frame, format_desc);
+                    frame->pts = video_pts;
+                }
             } else if (enc->codec_type == AVMEDIA_TYPE_AUDIO) {
                 frame      = make_av_audio_frame(in_frame, format_desc);
                 frame->pts = audio_pts;
@@ -415,7 +622,7 @@ struct ffmpeg_consumer : public core::frame_consumer
     std::exception_ptr exception_;
     std::mutex         exception_mutex_;
 
-    tbb::concurrent_bounded_queue<std::tuple<core::const_frame, std::int64_t, std::int64_t>> frame_buffer_;
+    tbb::concurrent_bounded_queue<queued_frame> frame_buffer_;
     std::thread                                                                              frame_thread_;
 
     common::bit_depth depth_;
@@ -445,7 +652,7 @@ struct ffmpeg_consumer : public core::frame_consumer
     ~ffmpeg_consumer()
     {
         if (frame_thread_.joinable()) {
-            frame_buffer_.push({core::const_frame{}, -1, -1});
+            frame_buffer_.push(queued_frame{});
             frame_thread_.join();
         }
     }
@@ -606,7 +813,7 @@ struct ffmpeg_consumer : public core::frame_consumer
                         state_["file/frame"] = frame_number++;
                     }
 
-                    std::tuple<core::const_frame, std::int64_t, std::int64_t> data;
+                    queued_frame data;
                     frame_buffer_.pop(data);
                     graph_->set_value("input",
                                       static_cast<double>(frame_buffer_.size() + 0.001) / frame_buffer_.capacity());
@@ -625,7 +832,7 @@ struct ffmpeg_consumer : public core::frame_consumer
                         });
                     graph_->set_value("frame-time", frame_timer.elapsed() * format_desc.fps * 0.5);
 
-                    if (!std::get<0>(data)) {
+                    if (!data.frame) {
                         packet_buffer.push(nullptr);
                         break;
                     }
@@ -650,7 +857,7 @@ struct ffmpeg_consumer : public core::frame_consumer
             }
         }
 
-        if (!frame_buffer_.try_push({frame, video_pts, audio_pts})) {
+        if (!frame_buffer_.try_push(queued_frame{std::move(frame), video_pts, audio_pts, field})) {
             graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
         }
 
