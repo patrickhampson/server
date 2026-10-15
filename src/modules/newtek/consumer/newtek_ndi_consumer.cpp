@@ -54,6 +54,8 @@ namespace caspar { namespace newtek {
 
 struct newtek_ndi_consumer : public core::frame_consumer
 {
+    static constexpr size_t max_buffered = 16; // twice what the send thread buffers before it starts
+
     static std::atomic<int> instances_;
     const int               instance_no_;
     const std::wstring      name_;
@@ -234,12 +236,26 @@ struct newtek_ndi_consumer : public core::frame_consumer
                 time_point += std::chrono::microseconds(frametimeUs);
                 while (!send_thread.interruption_requested()) {
                     core::const_frame frame;
+                    size_t            dropped = 0;
                     {
                         std::unique_lock<std::mutex> lock(buffer_mutex_);
                         worker_cond_.wait(lock, [&] { return !buffer_.empty(); });
                         graph_->set_value("buffered-frames", static_cast<double>(buffer_.size() + 0.001) / 8);
+                        // This tick and the channel's drift apart, and a stall here backs frames up. Drop
+                        // the excess rather than let latency and memory grow for as long as the channel
+                        // runs. An even number, so fields keep their order.
+                        if (buffer_.size() > max_buffered) {
+                            dropped = (buffer_.size() - max_buffered) & ~size_t(1);
+                            for (size_t n = 0; n < dropped; ++n) {
+                                buffer_.pop();
+                            }
+                        }
                         frame = std::move(buffer_.front());
                         buffer_.pop();
+                    }
+                    if (dropped > 0) {
+                        graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+                        CASPAR_LOG(warning) << print() << L" Dropped " << dropped << L" frames to catch up.";
                     }
                     graph_->set_value("ndi-tick", ndi_timer_.elapsed() * format_desc_.fps * 0.5);
                     ndi_timer_.restart();
