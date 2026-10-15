@@ -63,6 +63,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
     const std::string       discovery_server_url_;
     const bool              use_advertiser_;
     const bool              allow_monitoring_;
+    const bool              no_alpha_;
 
     core::video_format_desc              format_desc_;
     int                                  channel_index_;
@@ -92,7 +93,8 @@ struct newtek_ndi_consumer : public core::frame_consumer
                         bool         allow_fields,
                         std::string  discovery_server_url = "",
                         bool         use_advertiser       = false,
-                        bool         allow_monitoring     = true)
+                        bool         allow_monitoring     = true,
+                        bool         no_alpha             = false)
         : name_(!name.empty() ? name : default_ndi_name())
         , instance_no_(instances_++)
         , frame_no_(0)
@@ -100,6 +102,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
         , discovery_server_url_(discovery_server_url)
         , use_advertiser_(use_advertiser)
         , allow_monitoring_(allow_monitoring)
+        , no_alpha_(no_alpha)
         , channel_index_(0)
         , executor_(L"ndi_consumer[" + std::to_wstring(instance_no_) + L"]")
     {
@@ -190,7 +193,8 @@ struct newtek_ndi_consumer : public core::frame_consumer
         ndi_video_frame_.yres                 = format_desc.height;
         ndi_video_frame_.frame_rate_N         = format_desc.framerate.numerator() * format_desc.field_count;
         ndi_video_frame_.frame_rate_D         = format_desc.framerate.denominator();
-        ndi_video_frame_.FourCC               = NDIlib_FourCC_type_BGRA;
+        // BGRX is the same bytes as BGRA, but tells the SDK not to compress the alpha channel.
+        ndi_video_frame_.FourCC               = no_alpha_ ? NDIlib_FourCC_type_BGRX : NDIlib_FourCC_type_BGRA;
         ndi_video_frame_.line_stride_in_bytes = format_desc.width * 4;
         ndi_video_frame_.frame_format_type    = NDIlib_frame_format_type_progressive;
 
@@ -344,6 +348,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
         state["ndi/use_advertiser"]       = use_advertiser_;
         state["ndi/allow_monitoring"]     = allow_monitoring_;
         state["ndi/discovery_server_url"] = discovery_server_url_;
+        state["ndi/no_alpha"]             = no_alpha_;
         return state;
     }
 };
@@ -366,13 +371,14 @@ create_ndi_consumer(const std::vector<std::wstring>&                         par
     bool         allow_fields           = contains_param(L"ALLOW_FIELDS", params);
     bool         use_advertiser         = contains_param(L"USE_ADVERTISER", params);
     bool         allow_monitoring       = get_param(L"ALLOW_MONITORING", params, true);
+    bool         no_alpha               = contains_param(L"NO_ALPHA", params);
     std::wstring discovery_server_url_w = get_param(L"DISCOVERY_SERVER", params, L"");
     if (discovery_server_url_w.empty())
         discovery_server_url_w = env::properties().get(L"configuration.ndi.discovery-server", L"");
     std::string discovery_server_url = ndi::apply_default_discovery_port(u8(discovery_server_url_w));
 
     return spl::make_shared<newtek_ndi_consumer>(
-        name, allow_fields, discovery_server_url, use_advertiser, allow_monitoring);
+        name, allow_fields, discovery_server_url, use_advertiser, allow_monitoring, no_alpha);
 }
 
 spl::shared_ptr<core::frame_consumer>
@@ -385,6 +391,7 @@ create_preconfigured_ndi_consumer(const boost::property_tree::wptree&           
     bool         allow_fields           = ptree.get(L"allow-fields", false);
     bool         use_advertiser         = ptree.get(L"use-advertiser", false);
     bool         allow_monitoring       = ptree.get(L"allow-monitoring", true);
+    bool         no_alpha               = ptree.get(L"no-alpha", false);
     std::wstring discovery_server_url_w = ptree.get(L"discovery-server", L"");
     if (discovery_server_url_w.empty())
         discovery_server_url_w = env::properties().get(L"configuration.ndi.discovery-server", L"");
@@ -394,7 +401,7 @@ create_preconfigured_ndi_consumer(const boost::property_tree::wptree&           
         CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Newtek NDI consumer only supports 8-bit color depth."));
 
     return spl::make_shared<newtek_ndi_consumer>(
-        name, allow_fields, discovery_server_url, use_advertiser, allow_monitoring);
+        name, allow_fields, discovery_server_url, use_advertiser, allow_monitoring, no_alpha);
 }
 
 }} // namespace caspar::newtek
