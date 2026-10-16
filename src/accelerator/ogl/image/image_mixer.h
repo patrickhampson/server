@@ -60,6 +60,10 @@ class image_mixer final : public core::image_mixer
                                          common::bit_depth                          depth) override;
 #endif
 
+#ifdef CASPAR_CUDA_GL
+    core::mutable_frame import_cuda_frame(const void* tag, const core::cuda_frame& frame) override;
+#endif
+
     void update_aspect_ratio(double aspect_ratio) override;
 
     // core::image_mixer

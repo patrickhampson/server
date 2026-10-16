@@ -99,6 +99,7 @@ class const_frame final
 
     const void* stream_tag() const;
     const_frame with_tag(const void* new_tag) const;
+    const_frame with_audio(array<const std::int32_t> audio_data) const;
 
     const std::any& opaque() const;
 

@@ -22,9 +22,15 @@
 #pragma once
 
 #include <common/bit_depth.h>
+#include <common/except.h>
+
+#include <core/frame/frame.h>
+#include <core/frame/pixel_format.h>
+
+#include <array>
+#include <cstdint>
 
 #ifdef WIN32
-#include <core/frame/pixel_format.h>
 #include <memory>
 namespace caspar::accelerator::d3d {
 class d3d_texture2d;
@@ -32,6 +38,18 @@ class d3d_texture2d;
 #endif
 
 namespace caspar { namespace core {
+
+// An NV12 or P010 frame in CUDA memory. context is the CUcontext that owns the planes.
+struct cuda_frame
+{
+    void*                         context = nullptr;
+    std::array<std::uintptr_t, 2> planes{};
+    std::array<int, 2>            pitches{};
+    int                           width  = 0;
+    int                           height = 0;
+    common::bit_depth             depth  = common::bit_depth::bit8;
+    color_space                   color  = color_space::unknown;
+};
 
 class frame_factory
 {
@@ -52,6 +70,11 @@ class frame_factory
                                                  core::pixel_format                                      format,
                                                  common::bit_depth                                       depth) = 0;
 #endif
+
+    virtual class mutable_frame import_cuda_frame(const void* video_stream_tag, const cuda_frame& frame)
+    {
+        CASPAR_THROW_EXCEPTION(not_supported() << msg_info("This mixer can't import CUDA frames."));
+    }
 };
 
 }} // namespace caspar::core

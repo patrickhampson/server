@@ -550,6 +550,12 @@ vec4 get_rgba_color()
             float a  = get_sample(plane[3], TexCoord.st / TexCoord.q).r * precision_factor[3];
 			return vec4(b, g, r, a);
         }
+    case 13:    // nv12
+        {
+            float y  = get_sample(plane[0], TexCoord.st / TexCoord.q).r * precision_factor[0];
+            vec2 cbcr = get_sample(plane[1], TexCoord.st / TexCoord.q).rg * precision_factor[1];
+            return ycbcra_to_rgba(y, cbcr.x, cbcr.y, 1.0);
+        }
     }
     return vec4(0.0, 0.0, 0.0, 0.0);
 }

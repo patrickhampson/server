@@ -194,6 +194,17 @@ const_frame                      const_frame::with_tag(const void* new_tag) cons
 
     return new_frame;
 }
+const_frame const_frame::with_audio(array<const std::int32_t> audio_data) const
+{
+    if (!impl_) {
+        return const_frame();
+    }
+
+    const_frame new_frame;
+    new_frame.impl_              = std::make_shared<impl>(*impl_);
+    new_frame.impl_->audio_data_ = std::move(audio_data);
+    return new_frame;
+}
 const frame_geometry& const_frame::geometry() const { return impl_->geometry_; }
 const std::any&       const_frame::opaque() const { return impl_->opaque_; }
 const_frame::operator bool() const { return impl_ != nullptr && impl_->desc_.format != core::pixel_format::invalid; }

@@ -36,6 +36,7 @@
 #include <common/bit_depth.h>
 #include <common/future.h>
 #include <common/log.h>
+#include <common/scope_exit.h>
 
 #include <core/frame/frame.h>
 #include <core/frame/frame_transform.h>
@@ -44,6 +45,12 @@
 #include <core/video_format.h>
 
 #include <GL/glew.h>
+
+#ifdef CASPAR_CUDA_GL
+#include <ffnvcodec/dynlink_loader.h>
+
+#include <tbb/concurrent_queue.h>
+#endif
 
 #include <any>
 #include <vector>
@@ -250,6 +257,47 @@ class image_renderer
     }
 };
 
+#ifdef CASPAR_CUDA_GL
+CudaFunctions* cuda()
+{
+    static CudaFunctions* functions = [] {
+        CudaFunctions* result = nullptr;
+        if (cuda_load_functions(&result, nullptr) < 0) {
+            CASPAR_THROW_EXCEPTION(not_supported() << msg_info("libcuda isn't available."));
+        }
+        return result;
+    }();
+    return functions;
+}
+
+void cuda_check(CUresult result, const char* call)
+{
+    if (result != CUDA_SUCCESS) {
+        CASPAR_THROW_EXCEPTION(caspar_exception()
+                               << msg_info(std::string(call) + " failed: " + std::to_string(result)));
+    }
+}
+
+// A pooled texture registered with CUDA. Registering is slow, so it's done once per texture.
+struct cuda_texture
+{
+    std::shared_ptr<texture> tex;
+    CUcontext                context  = nullptr;
+    CUgraphicsResource       resource = nullptr;
+
+    ~cuda_texture()
+    {
+        CUcontext popped = nullptr;
+        if (resource && cuda()->cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+            cuda()->cuGraphicsUnregisterResource(resource);
+            cuda()->cuCtxPopCurrent(&popped);
+        }
+    }
+};
+
+using cuda_pool = tbb::concurrent_queue<std::shared_ptr<cuda_texture>>;
+#endif
+
 struct image_mixer::impl
     : public core::frame_factory
     , public std::enable_shared_from_this<impl>
@@ -261,6 +309,10 @@ struct image_mixer::impl
     std::vector<layer*>          layer_stack_;
 
     double aspect_ratio_ = 1.0;
+
+#ifdef CASPAR_CUDA_GL
+    std::array<std::shared_ptr<cuda_pool>, 2> cuda_pools_{std::make_shared<cuda_pool>(), std::make_shared<cuda_pool>()};
+#endif
 
   public:
     impl(const spl::shared_ptr<device>& ogl, const int channel_id, const size_t max_frame_size, common::bit_depth depth)
@@ -372,6 +424,72 @@ struct image_mixer::impl
                                    });
     }
 
+#ifdef CASPAR_CUDA_GL
+    core::mutable_frame import_cuda_frame(const void* tag, const core::cuda_frame& frame) override
+    {
+        core::pixel_format_desc desc(core::pixel_format::nv12, frame.color);
+        desc.planes.push_back(core::pixel_format_desc::plane(frame.width, frame.height, 1, frame.depth));
+        desc.planes.push_back(core::pixel_format_desc::plane(frame.width / 2, frame.height / 2, 2, frame.depth));
+
+        auto textures = ogl_->dispatch_sync([&] {
+            auto context = static_cast<CUcontext>(frame.context);
+            cuda_check(cuda()->cuCtxPushCurrent(context), "cuCtxPushCurrent");
+            CASPAR_SCOPE_EXIT { cuda()->cuCtxPopCurrent(&context); };
+
+            std::vector<future_texture> result;
+            for (int n = 0; n < 2; ++n) {
+                result.push_back(make_ready_future(
+                    copy_cuda_plane(cuda_pools_[n], context, frame.planes[n], frame.pitches[n], desc.planes[n])));
+            }
+            return result;
+        });
+
+        return core::mutable_frame(
+            tag, {}, {}, desc, [textures](std::vector<array<const std::uint8_t>>) -> std::any {
+                return std::make_shared<std::vector<future_texture>>(textures);
+            });
+    }
+
+    // Runs on the OpenGL thread with the CUDA context current.
+    std::shared_ptr<texture> copy_cuda_plane(const std::shared_ptr<cuda_pool>&     pool,
+                                             CUcontext                             context,
+                                             std::uintptr_t                        source,
+                                             int                                   pitch,
+                                             const core::pixel_format_desc::plane& plane)
+    {
+        std::shared_ptr<cuda_texture> slot;
+        if (!pool->try_pop(slot) || slot->context != context || slot->tex->width() != plane.width ||
+            slot->tex->height() != plane.height || slot->tex->depth() != plane.depth) {
+            slot          = std::make_shared<cuda_texture>();
+            slot->tex     = ogl_->create_texture(plane.width, plane.height, plane.stride, plane.depth);
+            slot->context = context;
+            cuda_check(cuda()->cuGraphicsGLRegisterImage(&slot->resource,
+                                                         static_cast<GLuint>(slot->tex->id()),
+                                                         GL_TEXTURE_2D,
+                                                         CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD),
+                       "cuGraphicsGLRegisterImage");
+        }
+
+        CUDA_MEMCPY2D copy = {};
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice     = source;
+        copy.srcPitch      = pitch;
+        copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+        copy.WidthInBytes  = plane.linesize;
+        copy.Height        = plane.height;
+
+        cuda_check(cuda()->cuGraphicsMapResources(1, &slot->resource, nullptr), "cuGraphicsMapResources");
+        auto result = cuda()->cuGraphicsSubResourceGetMappedArray(&copy.dstArray, slot->resource, 0, 0);
+        if (result == CUDA_SUCCESS) {
+            result = cuda()->cuMemcpy2D(&copy);
+        }
+        cuda()->cuGraphicsUnmapResources(1, &slot->resource, nullptr);
+        cuda_check(result, "cuMemcpy2D");
+
+        return std::shared_ptr<texture>(slot->tex.get(), [pool, slot](texture*) { pool->push(slot); });
+    }
+#endif
+
 #ifdef WIN32
     core::const_frame import_d3d_texture(const void*                                tag,
                                          const std::shared_ptr<d3d::d3d_texture2d>& d3d_texture,
@@ -441,6 +559,13 @@ image_mixer::create_frame(const void* tag, const core::pixel_format_desc& desc, 
 {
     return impl_->create_frame(tag, desc, depth);
 }
+
+#ifdef CASPAR_CUDA_GL
+core::mutable_frame image_mixer::import_cuda_frame(const void* tag, const core::cuda_frame& frame)
+{
+    return impl_->import_cuda_frame(tag, frame);
+}
+#endif
 
 #ifdef WIN32
 core::const_frame image_mixer::import_d3d_texture(const void*                                tag,
