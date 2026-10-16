@@ -12,6 +12,13 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
+#ifdef CASPAR_CUDA_GL
+#include <ffnvcodec/dynlink_cuda.h>
+extern "C" {
+#include <libavutil/hwcontext_cuda.h>
+}
+#endif
+
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -62,6 +69,35 @@ core::color_space get_color_space(const std::shared_ptr<AVFrame>& video)
     return result;
 }
 
+array<std::int32_t> copy_audio(const std::shared_ptr<AVFrame>& audio)
+{
+    if (!audio) {
+        return {};
+    }
+
+    const int channel_count = 16;
+    auto      audio_data    = std::vector<int32_t>(audio->nb_samples * channel_count, 0);
+
+    auto source_channel_count = audio->ch_layout.nb_channels;
+    if (source_channel_count == channel_count) {
+        std::memcpy(audio_data.data(),
+                    reinterpret_cast<int32_t*>(audio->data[0]),
+                    sizeof(int32_t) * channel_count * audio->nb_samples);
+    } else {
+        // This isn't pretty, but some callers may not provide 16 channels
+
+        auto dst = audio_data.data();
+        auto src = reinterpret_cast<int32_t*>(audio->data[0]);
+        for (auto i = 0; i < audio->nb_samples; i++) {
+            for (auto j = 0; j < std::min(channel_count, source_channel_count); ++j) {
+                dst[i * channel_count + j] = src[i * source_channel_count + j];
+            }
+        }
+    }
+
+    return audio_data;
+}
+
 core::mutable_frame make_frame(void*                            tag,
                                core::frame_factory&             frame_factory,
                                std::shared_ptr<AVFrame>         video,
@@ -97,31 +133,39 @@ core::mutable_frame make_frame(void*                            tag,
                 }
             }
         },
-        [&]() {
-            if (audio) {
-                const int channel_count = 16;
-                frame.audio_data()      = std::vector<int32_t>(audio->nb_samples * channel_count, 0);
-
-                auto source_channel_count = audio->ch_layout.nb_channels;
-                if (source_channel_count == channel_count) {
-                    std::memcpy(frame.audio_data().data(),
-                                reinterpret_cast<int32_t*>(audio->data[0]),
-                                sizeof(int32_t) * channel_count * audio->nb_samples);
-                } else {
-                    // This isn't pretty, but some callers may not provide 16 channels
-
-                    auto dst = frame.audio_data().data();
-                    auto src = reinterpret_cast<int32_t*>(audio->data[0]);
-                    for (auto i = 0; i < audio->nb_samples; i++) {
-                        for (auto j = 0; j < std::min(channel_count, source_channel_count); ++j) {
-                            dst[i * channel_count + j] = src[i * source_channel_count + j];
-                        }
-                    }
-                }
-            }
-        });
+        [&]() { frame.audio_data() = copy_audio(audio); });
 
     return frame;
+}
+
+core::mutable_frame make_cuda_frame(void*                            tag,
+                                    core::frame_factory&             frame_factory,
+                                    std::shared_ptr<AVFrame>         video,
+                                    std::shared_ptr<AVFrame>         audio,
+                                    core::color_space                color_space,
+                                    core::frame_geometry::scale_mode scale_mode)
+{
+#ifdef CASPAR_CUDA_GL
+    const auto frames = reinterpret_cast<AVHWFramesContext*>(video->hw_frames_ctx->data);
+
+    core::cuda_frame cuda;
+    cuda.context = static_cast<AVCUDADeviceContext*>(frames->device_ctx->hwctx)->cuda_ctx;
+    cuda.planes  = {reinterpret_cast<std::uintptr_t>(video->data[0]), reinterpret_cast<std::uintptr_t>(video->data[1])};
+    cuda.pitches = {video->linesize[0], video->linesize[1]};
+    cuda.width   = video->width;
+    cuda.height  = video->height;
+    cuda.depth   = frames->sw_format == AV_PIX_FMT_NV12 ? common::bit_depth::bit8 : common::bit_depth::bit16;
+    cuda.color   = color_space;
+
+    auto frame = frame_factory.import_cuda_frame(tag, cuda);
+    if (scale_mode != core::frame_geometry::scale_mode::stretch) {
+        frame.geometry() = core::frame_geometry::get_default(scale_mode);
+    }
+    frame.audio_data() = copy_audio(audio);
+    return frame;
+#else
+    CASPAR_THROW_EXCEPTION(not_supported() << msg_info("Built without CUDA."));
+#endif
 }
 
 std::tuple<core::pixel_format, common::bit_depth> get_pixel_format(AVPixelFormat pix_fmt)
@@ -340,6 +384,7 @@ std::shared_ptr<AVFrame> make_av_video_frame(const core::const_frame& frame, con
             break;
         case core::pixel_format::gbrp:
         case core::pixel_format::gbrap:
+        case core::pixel_format::nv12:
             // TODO
             break;
         case core::pixel_format::count:

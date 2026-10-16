@@ -35,6 +35,7 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
@@ -92,6 +93,74 @@ const AVCodec* get_decoder(AVCodecID codec_id)
     return result != nullptr ? result : avcodec_find_decoder(codec_id);
 }
 
+// One CUDA device for every producer. Null unless hwaccel is cuda and the device opens.
+AVBufferRef* shared_cuda_device()
+{
+    static const auto device = []() -> std::shared_ptr<AVBufferRef> {
+#ifdef CASPAR_CUDA_GL
+        AVBufferRef* ref = nullptr;
+        if (env::properties().get<std::wstring>(L"configuration.ffmpeg.producer.hwaccel", L"none") == L"cuda") {
+            if (av_hwdevice_ctx_create(&ref, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) >= 0) {
+                return {ref, [](AVBufferRef* ptr) { av_buffer_unref(&ptr); }};
+            }
+            CASPAR_LOG(warning) << L"[ffmpeg] Couldn't open a CUDA device. Decoding in software.";
+        }
+#endif
+        return nullptr;
+    }();
+    return device.get();
+}
+
+bool nvdec_decodes(const AVStream* stream)
+{
+    const auto codec  = get_decoder(stream->codecpar->codec_id);
+    const auto format = stream->codecpar->format;
+    if (!codec || (format != AV_PIX_FMT_YUV420P && format != AV_PIX_FMT_YUV420P10)) {
+        return false;
+    }
+    for (int n = 0; const auto config = avcodec_get_hw_config(codec, n); ++n) {
+        if (config->device_type == AV_HWDEVICE_TYPE_CUDA &&
+            (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// buffersrc needs a CUDA frames context before the first frame. NVDEC decodes into its own,
+// and buffersrc passes those frames on as they are.
+void set_cuda_frames(AVFilterContext* source, AVBufferRef* device, const AVCodecContext* ctx)
+{
+    auto frames =
+        std::shared_ptr<AVBufferRef>(av_hwframe_ctx_alloc(device), [](AVBufferRef* ptr) { av_buffer_unref(&ptr); });
+    if (!frames) {
+        FF_RET(AVERROR(ENOMEM), "av_hwframe_ctx_alloc");
+    }
+    auto frames_ctx       = reinterpret_cast<AVHWFramesContext*>(frames->data);
+    frames_ctx->format    = AV_PIX_FMT_CUDA;
+    frames_ctx->sw_format = ctx->pix_fmt == AV_PIX_FMT_YUV420P10 ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
+    frames_ctx->width     = ctx->width;
+    frames_ctx->height    = ctx->height;
+    FF(av_hwframe_ctx_init(frames.get()));
+
+    auto params = std::shared_ptr<AVBufferSrcParameters>(av_buffersrc_parameters_alloc(), av_free);
+    if (!params) {
+        FF_RET(AVERROR(ENOMEM), "av_buffersrc_parameters_alloc");
+    }
+    params->hw_frames_ctx = frames.get();
+    FF(av_buffersrc_parameters_set(source, params.get()));
+}
+
+// The output weaves the two fields of each channel frame back together, so an interlaced frame
+// with the channel's size, rate and field order needs no deinterlacing. NTSC is bottom field first.
+bool weaves_exactly(const AVFrame* frame, AVRational frame_rate, const core::video_format_desc& format_desc)
+{
+    const auto top_field_first = (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0;
+    return format_desc.field_count == 2 && frame->width == format_desc.width &&
+           frame->height == format_desc.height && top_field_first == (format_desc.format != core::video_format::ntsc) &&
+           av_cmp_q(frame_rate, {format_desc.framerate.numerator(), format_desc.framerate.denominator()}) == 0;
+}
+
 // TODO (fix) Handle ts discontinuities.
 // TODO (feat) Forward options.
 
@@ -118,10 +187,11 @@ class Decoder
 
   public:
     std::shared_ptr<AVCodecContext> ctx;
+    std::atomic<bool>               cuda_failed = {false};
 
     Decoder() = default;
 
-    explicit Decoder(AVStream* stream)
+    explicit Decoder(AVStream* stream, AVBufferRef* cuda_device = nullptr)
         : st(stream)
     {
         const auto codec = get_decoder(stream->codecpar->codec_id);
@@ -145,7 +215,18 @@ class Decoder
                 ctx->pix_fmt = get_pix_fmt_with_alpha(ctx->pix_fmt);
         }
 
-        int thread_count = env::properties().get(L"configuration.ffmpeg.producer.threads", 0);
+        if (cuda_device) {
+            ctx->hw_device_ctx = av_buffer_ref(cuda_device);
+            ctx->get_format    = [](AVCodecContext*, const AVPixelFormat* formats) {
+                // No software fallback here; the filter graph only takes CUDA frames.
+                while (*formats != AV_PIX_FMT_NONE && *formats != AV_PIX_FMT_CUDA) {
+                    ++formats;
+                }
+                return *formats;
+            };
+        }
+
+        int thread_count = cuda_device ? 1 : env::properties().get(L"configuration.ffmpeg.producer.threads", 0);
         FF(av_opt_set_int(ctx.get(), "threads", thread_count, 0));
 
         ctx->pkt_timebase = stream->time_base;
@@ -241,7 +322,12 @@ class Decoder
             } catch (boost::thread_interrupted&) {
                 // Do nothing...
             } catch (...) {
-                eof = true;
+                // The producer restarts a failed CUDA decode in software rather than ending the clip.
+                if (ctx->hw_device_ctx) {
+                    cuda_failed = true;
+                } else {
+                    eof = true;
+                }
                 CASPAR_LOG_CURRENT_EXCEPTION();
             }
         });
@@ -323,24 +409,13 @@ struct Filter
            std::map<int, Decoder>&        streams,
            int64_t                        start_time,
            AVMediaType                    media_type,
-           const core::video_format_desc& format_desc)
+           const core::video_format_desc& format_desc,
+           AVBufferRef*                   cuda_device = nullptr)
     {
         if (media_type == AVMEDIA_TYPE_VIDEO) {
             if (filter_spec.empty()) {
                 filter_spec = "null";
             }
-
-            auto deint = u8(
-                env::properties().get<std::wstring>(L"configuration.ffmpeg.producer.auto-deinterlace", L"interlaced"));
-
-            if (deint != "none") {
-                filter_spec += (boost::format(",bwdif=mode=send_field:parity=auto:deint=%s") % deint).str();
-            }
-
-            filter_spec += (boost::format(",fps=fps=%d/%d:start_time=%f") %
-                            (format_desc.framerate.numerator() * format_desc.field_count) %
-                            format_desc.framerate.denominator() % (static_cast<double>(start_time) / AV_TIME_BASE))
-                               .str();
         } else if (media_type == AVMEDIA_TYPE_AUDIO) {
             if (filter_spec.empty()) {
                 filter_spec = "anull";
@@ -453,6 +528,26 @@ struct Filter
             }
         }
 
+        AVStream* cuda_stream = nullptr;
+        if (media_type == AVMEDIA_TYPE_VIDEO) {
+            auto deint = u8(
+                env::properties().get<std::wstring>(L"configuration.ffmpeg.producer.auto-deinterlace", L"interlaced"));
+            auto passthrough = env::properties().get(L"configuration.ffmpeg.producer.interlaced-passthrough", false);
+
+            // bwdif can't run on CUDA frames, so only decode on NVDEC when there's nothing to deinterlace.
+            if (cuda_device && deint == "interlaced" && video_streams.size() == 1 && nvdec_decodes(video_streams[0]) &&
+                (video_streams[0]->codecpar->field_order == AV_FIELD_PROGRESSIVE || passthrough)) {
+                cuda_stream = video_streams[0];
+            } else if (deint != "none") {
+                filter_spec += (boost::format(",bwdif=mode=send_field:parity=auto:deint=%s") % deint).str();
+            }
+
+            filter_spec += (boost::format(",fps=fps=%d/%d:start_time=%f") %
+                            (format_desc.framerate.numerator() * format_desc.field_count) %
+                            format_desc.framerate.denominator() % (static_cast<double>(start_time) / AV_TIME_BASE))
+                               .str();
+        }
+
         graph = std::shared_ptr<AVFilterGraph>(avfilter_graph_alloc(),
                                                [](AVFilterGraph* ptr) { avfilter_graph_free(&ptr); });
 
@@ -496,14 +591,16 @@ struct Filter
 
                 auto it = streams.find(stream->index);
                 if (it == streams.end()) {
-                    it = streams.emplace(stream->index, stream).first;
+                    it = streams.try_emplace(stream->index, stream, stream == cuda_stream ? cuda_device : nullptr)
+                             .first;
                 }
 
                 auto st = it->second.ctx;
 
                 if (st->codec_type == AVMEDIA_TYPE_VIDEO) {
                     auto args = (boost::format("video_size=%dx%d:pix_fmt=%d:time_base=%d/%d") % st->width % st->height %
-                                 st->pix_fmt % st->pkt_timebase.num % st->pkt_timebase.den)
+                                 (stream == cuda_stream ? AV_PIX_FMT_CUDA : st->pix_fmt) % st->pkt_timebase.num %
+                                 st->pkt_timebase.den)
                                     .str();
                     auto name = (boost::format("in_%d") % stream->index).str();
 
@@ -517,9 +614,12 @@ struct Filter
                         args += (boost::format(":frame_rate=%d/%d") % st->framerate.num % st->framerate.den).str();
                     }
 
-                    AVFilterContext* source = nullptr;
-                    FF(avfilter_graph_create_filter(
-                        &source, avfilter_get_by_name("buffer"), name.c_str(), args.c_str(), nullptr, graph.get()));
+                    auto source =
+                        FFMEM(avfilter_graph_alloc_filter(graph.get(), avfilter_get_by_name("buffer"), name.c_str()));
+                    if (stream == cuda_stream) {
+                        set_cuda_frames(source, cuda_device, st.get());
+                    }
+                    FF(avfilter_init_str(source, args.c_str()));
                     FF(avfilter_link(source, 0, cur->filter_ctx, cur->pad_idx));
                     sources.emplace(stream->index, source);
                 } else if (st->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -574,6 +674,8 @@ struct Filter
                                               AV_PIX_FMT_GBRP16,
                                               AV_PIX_FMT_GBRAP,
                                               AV_PIX_FMT_GBRAP16,
+                                              // NVDEC frames pass through fps untouched
+                                              AV_PIX_FMT_CUDA,
                                               AV_PIX_FMT_NONE};
 #if LIBAVUTIL_VERSION_MAJOR >= 60 // FFmpeg 8
             FF(av_opt_set_array(sink,
@@ -703,6 +805,8 @@ struct AVProducer::Impl
 
     int                              seekable_ = 2;
     core::frame_geometry::scale_mode scale_mode_;
+    const bool                       passthrough_;
+    AVBufferRef*                     cuda_device_    = shared_cuda_device();
     int64_t                          frame_count_    = 0;
     bool                             frame_flush_    = true;
     int64_t                          frame_time_     = AV_NOPTS_VALUE;
@@ -747,6 +851,7 @@ struct AVProducer::Impl
         , vfilter_(vfilter)
         , seekable_(seekable)
         , scale_mode_(scale_mode)
+        , passthrough_(env::properties().get(L"configuration.ffmpeg.producer.interlaced-passthrough", false))
         , video_executor_(L"video-executor")
         , audio_executor_(L"audio-executor")
     {
@@ -843,9 +948,11 @@ struct AVProducer::Impl
 
         boost::range::rotate(audio_cadence, std::end(audio_cadence) - 1);
 
-        Frame frame;
-        timer frame_timer;
-        timer decode_timer;
+        Frame                    frame;
+        std::shared_ptr<AVFrame> prev_video;
+        core::const_frame        prev_picture;
+        timer                    frame_timer;
+        timer                    decode_timer;
 
         int warning_debounce = 0;
 
@@ -858,6 +965,12 @@ struct AVProducer::Impl
                     frame = Frame{};
                     continue;
                 }
+            }
+
+            if (std::any_of(decoders_.begin(), decoders_.end(), [](auto& p) { return p.second.cuda_failed.load(); })) {
+                decode_in_software(frame);
+                frame = Frame{};
+                continue;
             }
 
             {
@@ -949,8 +1062,28 @@ struct AVProducer::Impl
                 frame.duration   = av_rescale_q(frame.audio->nb_samples, {1, sr}, TIME_BASE_Q);
             }
 
-            frame.frame = core::draw_frame(
-                make_frame(this, *frame_factory_, frame.video, frame.audio, get_color_space(frame.video), scale_mode_));
+            core::const_frame picture;
+            if (frame.video && prev_video && frame.video->buf[0] && prev_video->buf[0] &&
+                frame.video->buf[0]->buffer == prev_video->buf[0]->buffer) {
+                // fps repeats a frame by referencing its buffer again. Reuse the upload.
+                picture = prev_picture.with_audio(copy_audio(frame.audio));
+            } else if (frame.video && frame.video->format == AV_PIX_FMT_CUDA) {
+                try {
+                    picture = core::const_frame(make_cuda_frame(
+                        this, *frame_factory_, frame.video, frame.audio, get_color_space(frame.video), scale_mode_));
+                } catch (...) {
+                    CASPAR_LOG_CURRENT_EXCEPTION();
+                    decode_in_software(frame);
+                    frame = Frame{};
+                    continue;
+                }
+            } else {
+                picture = core::const_frame(make_frame(
+                    this, *frame_factory_, frame.video, frame.audio, get_color_space(frame.video), scale_mode_));
+            }
+            prev_video        = frame.video;
+            prev_picture      = picture;
+            frame.frame       = core::draw_frame(std::move(picture));
             frame.frame_count = frame_count_++;
 
             graph_->set_value("decode-time", decode_timer.elapsed() * format_desc_.fps * 0.5);
@@ -1186,6 +1319,17 @@ struct AVProducer::Impl
                 continue;
             }
 
+            if (frame->flags & AV_FRAME_FLAG_INTERLACED) {
+                if (passthrough_ && weaves_exactly(frame.get(), it->second.ctx->framerate, format_desc_)) {
+                    // bwdif passes it through, and fps repeats it for the second field.
+                    frame->flags &= ~AV_FRAME_FLAG_INTERLACED;
+                } else if (frame->format == AV_PIX_FMT_CUDA) {
+                    // A CUDA graph has no bwdif.
+                    it->second.cuda_failed = true;
+                    continue;
+                }
+            }
+
             for (auto& source : p.second) {
                 if (!frame->data[0]) {
                     FF(av_buffersrc_close(source, frame->pts, 0));
@@ -1209,6 +1353,13 @@ struct AVProducer::Impl
         return result;
     }
 
+    void decode_in_software(const Frame& frame)
+    {
+        CASPAR_LOG(warning) << print() << " Can't decode this clip on NVDEC. Decoding in software.";
+        cuda_device_ = nullptr;
+        seek_internal(frame.pts != AV_NOPTS_VALUE ? frame.pts : start_.load());
+    }
+
     void seek_internal(int64_t time)
     {
         time = time != AV_NOPTS_VALUE ? time : 0;
@@ -1229,7 +1380,13 @@ struct AVProducer::Impl
 
     void reset(int64_t start_time)
     {
-        video_filter_ = Filter(vfilter_, input_, decoders_, start_time, AVMEDIA_TYPE_VIDEO, format_desc_);
+        video_filter_ = Filter(vfilter_,
+                               input_,
+                               decoders_,
+                               start_time,
+                               AVMEDIA_TYPE_VIDEO,
+                               format_desc_,
+                               vfilter_.empty() ? cuda_device_ : nullptr);
         audio_filter_ = Filter(afilter_, input_, decoders_, start_time, AVMEDIA_TYPE_AUDIO, format_desc_);
 
         sources_.clear();
