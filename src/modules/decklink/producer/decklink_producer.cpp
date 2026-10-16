@@ -74,6 +74,8 @@ struct Filter
     AVFilterContext*               sink         = nullptr;
     AVFilterContext*               video_source = nullptr;
     AVFilterContext*               audio_source = nullptr;
+    bool                           passthrough  = false;
+    int64_t                        first_pts    = AV_NOPTS_VALUE;
 
     Filter() {}
 
@@ -81,29 +83,37 @@ struct Filter
            AVMediaType                          type,
            const core::video_format_desc&       format_desc,
            const com_ptr<IDeckLinkDisplayMode>& dm,
-           bool                                 hdr)
+           bool                                 hdr,
+           bool                                 field_passthrough)
     {
         BMDTimeScale timeScale;
         BMDTimeValue frameDuration;
         dm->GetFrameRate(&frameDuration, &timeScale);
 
         if (type == AVMEDIA_TYPE_VIDEO) {
+            // An input in the channel's own interlaced format needs no deinterlacing: fps sends each frame twice,
+            // once per field, and the output weaves the fields back together.
+            passthrough =
+                field_passthrough && filter_spec.empty() &&
+                (dm->GetFieldDominance() == bmdUpperFieldFirst || dm->GetFieldDominance() == bmdLowerFieldFirst) &&
+                get_caspar_video_format(dm->GetDisplayMode()) == format_desc.format;
+
             if (filter_spec.empty()) {
                 filter_spec = "null";
             }
 
             boost::rational<int> bmdFramerate(
                 timeScale / 1000 * (dm->GetFieldDominance() == bmdProgressiveFrame ? 1 : 2), frameDuration / 1000);
-            bool doFps = bmdFramerate != (format_desc.framerate * format_desc.field_count);
+            bool doFps = passthrough || bmdFramerate != (format_desc.framerate * format_desc.field_count);
             bool i2p   = (dm->GetFieldDominance() != bmdProgressiveFrame) && (1 == format_desc.field_count);
 
             std::string deintStr = (doFps || i2p) ? ",bwdif=mode=send_field" : ",yadif=mode=send_field_nospatial";
             switch (dm->GetFieldDominance()) {
                 case bmdUpperFieldFirst:
-                    filter_spec += deintStr + ":parity=tff:deint=all";
+                    filter_spec += passthrough ? "" : deintStr + ":parity=tff:deint=all";
                     break;
                 case bmdLowerFieldFirst:
-                    filter_spec += deintStr + ":parity=bff:deint=all";
+                    filter_spec += passthrough ? "" : deintStr + ":parity=bff:deint=all";
                     break;
                 case bmdUnknownFieldDominance:
                     filter_spec += deintStr + ":parity=auto:deint=interlaced";
@@ -481,6 +491,7 @@ class decklink_producer : public IDeckLinkInputCallback
     bool freeze_on_lost_;
     bool has_signal_;
     bool hdr_;
+    bool field_passthrough_;
 
     core::draw_frame last_frame_;
 
@@ -511,13 +522,15 @@ class decklink_producer : public IDeckLinkInputCallback
                       std::string                                 afilter,
                       const std::wstring&                         format,
                       bool                                        freeze_on_lost,
-                      bool                                        hdr)
+                      bool                                        hdr,
+                      bool                                        field_passthrough)
         : device_index_(device_index)
         , format_desc_(std::move(format_desc))
         , frame_factory_(frame_factory)
         , format_repository_(format_repository)
         , freeze_on_lost_(freeze_on_lost)
         , hdr_(hdr)
+        , field_passthrough_(field_passthrough)
         , input_format(format_desc_)
         , vfilter_(std::move(vfilter))
         , afilter_(std::move(afilter))
@@ -528,8 +541,8 @@ class decklink_producer : public IDeckLinkInputCallback
         }
 
         mode_ = get_display_mode(input_, input_format.format, get_pixel_format2(hdr_), bmdSupportedVideoModeDefault);
-        video_filter_  = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_);
-        audio_filter_  = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_);
+        video_filter_  = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_, field_passthrough_);
+        audio_filter_  = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_, false);
         video_decoder_ = Decoder(hdr_, mode_);
 
         boost::range::rotate(audio_cadence_, std::end(audio_cadence_) - 1);
@@ -578,6 +591,7 @@ class decklink_producer : public IDeckLinkInputCallback
         }
 
         CASPAR_LOG(info) << print() << L" Initialized";
+        log_field_passthrough();
     }
 
     ~decklink_producer()
@@ -621,8 +635,9 @@ class decklink_producer : public IDeckLinkInputCallback
 
             graph_->set_text(print());
 
-            video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_);
-            audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_);
+            video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_, field_passthrough_);
+            audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_, false);
+            log_field_passthrough();
 
             // reinitializing video input with the new display mode
             if (FAILED(
@@ -799,8 +814,8 @@ class decklink_producer : public IDeckLinkInputCallback
                                         << static_cast<int>(sync_drift * 1000) << "ms), recreating filters to resync";
 
                     // Recreate filters to clear all buffered data
-                    video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_);
-                    audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_);
+                    video_filter_ = Filter(vfilter_, AVMEDIA_TYPE_VIDEO, format_desc_, mode_, hdr_, field_passthrough_);
+                    audio_filter_ = Filter(afilter_, AVMEDIA_TYPE_AUDIO, format_desc_, mode_, hdr_, false);
 
                     in_sync_  = 0.0;
                     out_sync_ = 0.0;
@@ -815,7 +830,12 @@ class decklink_producer : public IDeckLinkInputCallback
                 auto frame = core::draw_frame(make_frame(this, *frame_factory_, av_video, av_audio, color_space));
                 auto field = core::video_field::progressive;
                 if (format_desc_.field_count == 2) {
-                    field = frame_count_ % 2 == 0 ? core::video_field::a : core::video_field::b;
+                    // fps counts in fields from the first frame, so a passed-through frame's pts says which copy it is.
+                    if (video_filter_.first_pts == AV_NOPTS_VALUE) {
+                        video_filter_.first_pts = av_video->pts;
+                    }
+                    auto n = video_filter_.passthrough ? av_video->pts - video_filter_.first_pts : frame_count_;
+                    field  = n % 2 == 0 ? core::video_field::a : core::video_field::b;
                 }
 
                 {
@@ -881,6 +901,17 @@ class decklink_producer : public IDeckLinkInputCallback
         }
     }
 
+    void log_field_passthrough() const
+    {
+        if (field_passthrough_) {
+            CASPAR_LOG(info) << print()
+                             << (video_filter_.passthrough
+                                     ? L" Passing fields through"
+                                     : L" Not passing fields through: the input isn't in the channel's interlaced "
+                                       L"format, or a filter is set");
+        }
+    }
+
     bool is_ready()
     {
         std::lock_guard<std::mutex> lock(buffer_mutex_);
@@ -915,7 +946,8 @@ class decklink_producer_proxy : public core::frame_producer
                                      uint32_t                                    length,
                                      const std::wstring&                         format,
                                      bool                                        freeze_on_lost,
-                                     bool                                        hdr)
+                                     bool                                        hdr,
+                                     bool                                        field_passthrough)
         : length_(length)
         , executor_(L"decklink_producer[" + std::to_wstring(device_index) + L"]")
     {
@@ -931,7 +963,8 @@ class decklink_producer_proxy : public core::frame_producer
                                                   afilter,
                                                   format,
                                                   freeze_on_lost,
-                                                  hdr));
+                                                  hdr,
+                                                  field_passthrough));
         });
     }
 
@@ -982,6 +1015,10 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
 
     auto hdr = contains_param(L"10BIT", params);
 
+    // Skips deinterlacing an input in the channel's own interlaced format. Only correct when the layer is shown at
+    // its native size and position, and progressive consumers on the channel see each frame woven, twice.
+    auto field_passthrough = contains_param(L"FIELD_PASSTHROUGH", params);
+
     auto format_str = get_param(L"FORMAT", params);
 
     auto filter_str = get_param(L"FILTER", params);
@@ -1003,6 +1040,7 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
                                                      length,
                                                      format_str,
                                                      freeze_on_lost,
-                                                     hdr);
+                                                     hdr,
+                                                     field_passthrough);
 }
 }} // namespace caspar::decklink
